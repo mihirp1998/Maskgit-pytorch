@@ -49,6 +49,8 @@ class MaskGIT(Trainer):
             from Metrics.sample_and_eval import SampleAndEval
             self.sae = SampleAndEval(device=self.args.device, num_images=50_000)
 
+        self.dtype = torch.bfloat16 if self.args.dtype == "bfloat16" else (torch.float16 if self.args.dtype == "float16" else torch.float32)
+
     def get_network(self, archi):
         """ return the network, load checkpoint if self.args.resume == True
             :param
@@ -179,6 +181,7 @@ class MaskGIT(Trainer):
         for x, y in bar:
             x = x.to(self.args.device)
             y = y.to(self.args.device)
+            assert x.min() >= (0 - torch.finfo(self.dtype).eps) and x.max() <= (1 + torch.finfo(self.dtype).eps)
             x = 2 * x - 1  # normalize from x in [0,1] to [-1,1] for VQGAN
 
             # Drop xx% of the condition for cfg
@@ -192,9 +195,10 @@ class MaskGIT(Trainer):
             # Mask the encoded tokens
             masked_code, mask = self.get_mask_code(code, value=self.args.mask_value, codebook_size=self.codebook_size)
 
-            with torch.cuda.amp.autocast():                             # half precision
+            with torch.cuda.amp.autocast(dtype=self.dtype):                         # half precision
                 text_code = torch.randint(0,self.text_vocab_size,[masked_code.shape[0],self.seq_len], device="cuda")
                 pred, pred_text = self.vit(masked_code, y,text_code, drop_label=drop_label)  # The unmasked tokens prediction
+                
                 # Cross-entropy loss
                 loss = self.criterion(pred.reshape(-1, self.codebook_size + 1), code.view(-1)) / self.args.grad_cum
                 # st()
@@ -253,7 +257,7 @@ class MaskGIT(Trainer):
                 self.train_data.sampler.set_epoch(e)
 
             # Train for one epoch
-            train_loss = self.train_one_epoch()
+            train_loss = self.train_one_epoch(log_iter=self.args.log_iter)
 
             # Synch loss
             if self.args.is_multi_gpus:
@@ -376,7 +380,7 @@ class MaskGIT(Trainer):
                 if mask.sum() == 0:  # Break if code is fully predicted
                     break
 
-                with torch.cuda.amp.autocast():  # half precision
+                with torch.cuda.amp.autocast(dtype=self.dtype):  # half precision
                     if w != 0:
                         st()
                         # Model Prediction

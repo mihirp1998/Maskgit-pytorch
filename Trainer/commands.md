@@ -1,0 +1,1 @@
+python main.py --data=celeba --vqgan-folder="pretrained_maskgit/VQGAN/" --bsize=32 --drop-label=1.0 --cfg_w=0 --writer-log=logs/v0 --log_iter=100 

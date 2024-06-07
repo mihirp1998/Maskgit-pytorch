@@ -10,7 +10,8 @@ import torch
 from torch.distributed import init_process_group, destroy_process_group
 
 from Trainer.vit import MaskGIT
-
+from image_utils import library_ops
+from decoupled_utils import breakpoint_on_error
 
 def main(args):
     """ Main function:Train or eval MaskGIT """
@@ -82,6 +83,8 @@ if __name__ == "__main__":
     parser.add_argument("--test-only",    action='store_true',            help="only evaluate the model")
     parser.add_argument("--resume",       action='store_true',            help="resume training of the model")
     parser.add_argument("--debug",        action='store_true',            help="debug")
+    parser.add_argument("--dtype",        type=str,   default="bfloat16",   help="dtype")
+    parser.add_argument("--log_iter",      type=int,   default=2500,          help="log every x iterations")
     args = parser.parse_args()
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.iter = 0
@@ -97,12 +100,13 @@ if __name__ == "__main__":
 
     world_size = torch.cuda.device_count()
 
-    if world_size > 1:  # launch multi training
-        print(f"{world_size} GPU(s) found, launch multi-gpus training")
-        args.is_multi_gpus = True
-        launch_multi_main(args)
-    else:  # launch single Gpu training
-        print(f"{world_size} GPU found")
-        args.is_master = True
-        args.is_multi_gpus = False
-        main(args)
+    with breakpoint_on_error():
+        if world_size > 1:  # launch multi training
+            print(f"{world_size} GPU(s) found, launch multi-gpus training")
+            args.is_multi_gpus = True
+            launch_multi_main(args)
+        else:  # launch single Gpu training
+            print(f"{world_size} GPU found")
+            args.is_master = True
+            args.is_multi_gpus = False
+            main(args)

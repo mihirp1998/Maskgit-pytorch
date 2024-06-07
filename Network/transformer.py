@@ -174,7 +174,14 @@ class MaskTransformer(nn.Module):
                 attn:          -> list(torch.FloatTensor): list of attention for visualization
         """
         b, w, h = img_token.size()
-        # st()
+
+        if y.ndim > 1:
+            # y is our text tokens if it is [B, N] so we give dummy conditioning.
+            y = torch.zeros_like(y[:, 0])
+
+        if drop_label.ndim > 1:
+            drop_label = drop_label[:, 0]
+
         cls_token = y.view(b, -1) + self.codebook_size + 1  # Shift the class token by the amount of codebook
 
         cls_token[drop_label] = self.codebook_size + 1 + self.nclass  # Drop condition
