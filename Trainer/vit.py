@@ -343,6 +343,8 @@ class MaskGIT(Trainer):
         self.vit.eval()
         l_codes = []  # Save the intermediate codes predicted
         l_mask = []   # Save the intermediate masks
+        text_l_codes = []
+        text_l_mask = []
         with torch.no_grad():
             if labels is None:  # Default classes generated
                 # goldfish, chicken, tiger cat, hourglass, ship, dog, race car, airliner, teddy bear, random
@@ -351,6 +353,7 @@ class MaskGIT(Trainer):
 
             drop = torch.ones(nb_sample, dtype=torch.bool).to(self.args.device)
             if init_code is not None:  # Start with a pre-define code
+                assert False
                 code = init_code
                 mask = (init_code == self.codebook_size).float().view(nb_sample, self.patch_size*self.patch_size)
             else:  # Initialize a code
@@ -359,15 +362,14 @@ class MaskGIT(Trainer):
                 else:  # Code initialize with masked tokens
                     code = torch.full((nb_sample, self.patch_size, self.patch_size), self.args.mask_value).to(self.args.device)
                     text_code = torch.full((nb_sample, self.seq_len), self.args.mask_value).to(self.args.device)
-                    st()
-                mask = torch.ones(nb_sample, self.patch_size*self.patch_size).to(self.args.device)
+                mask = torch.ones(nb_sample, self.patch_size*self.patch_size + self.seq_len ).to(self.args.device)
 
             # Instantiate scheduler
             if isinstance(sched_mode, str):  # Standard ones
                 scheduler = self.adap_sche(step, mode=sched_mode)
             else:  # Custom one
                 scheduler = sched_mode
-
+            # st()
             # Beginning of sampling, t = number of token to predict a step "indice"
             for indice, t in enumerate(scheduler):
                 if mask.sum() < t:  # Cannot predict more token than 16*16 or 32*32
@@ -375,65 +377,87 @@ class MaskGIT(Trainer):
 
                 if mask.sum() == 0:  # Break if code is fully predicted
                     break
-
+                # st()
                 with torch.cuda.amp.autocast():  # half precision
                     if w != 0:
-                        st()
                         # Model Prediction
                         logit, text_logit = self.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                          torch.cat([labels, labels], dim=0),
                                          torch.cat([text_code, text_code], dim=0),
                                          torch.cat([~drop, drop], dim=0))
+                        # st()
                         logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                         _w = w * (indice / (len(scheduler)-1))
                         # Classifier Free Guidance
                         logit = (1 + _w) * logit_c - _w * logit_u
-                        
                         text_logit_c, text_logit_u = torch.chunk(text_logit, 2, dim=0)
-                        _w = w * (indice / (len(scheduler)-1))
                         # Classifier Free Guidance
-                        st()
                         text_logit = (1 + _w) * text_logit_c - _w * text_logit_u
                     else:
-                        logit = self.vit(code.clone(), labels, drop_label=~drop)
-
+                        # st()
+                        logit, text_logit = self.vit(code.clone(), labels, text_code, drop_label=~drop)
+                
                 prob = torch.softmax(logit * sm_temp, -1)
                 # Sample the code from the softmax prediction
                 distri = torch.distributions.Categorical(probs=prob)
                 pred_code = distri.sample()
-
                 conf = torch.gather(prob, 2, pred_code.view(nb_sample, self.patch_size*self.patch_size, 1))
+                
+                text_prob = torch.softmax(text_logit * sm_temp, -1)
+                # Sample the code from the softmax prediction
+                text_distri = torch.distributions.Categorical(probs=text_prob)
+                text_code = text_distri.sample()                
+                text_conf = torch.gather(text_prob, 2, text_code.view(nb_sample, self.seq_len, 1))
+
+                merged_pred_code = torch.cat([pred_code,text_code],dim=1)
+                merged_conf = torch.cat([conf, text_conf], dim=1)
+                # st()
 
                 if randomize == "linear":  # add gumbel noise decreasing over the sampling process
                     ratio = (indice / (len(scheduler)-1))
-                    rand = r_temp * np.random.gumbel(size=(nb_sample, self.patch_size*self.patch_size)) * (1 - ratio)
-                    conf = torch.log(conf.squeeze()) + torch.from_numpy(rand).to(self.args.device)
+                    rand = r_temp * np.random.gumbel(size=(nb_sample, self.patch_size*self.patch_size + self.seq_len)) * (1 - ratio)
+                    merged_conf = torch.log(merged_conf.squeeze()) + torch.from_numpy(rand).to(self.args.device)
                 elif randomize == "warm_up":  # chose random sample for the 2 first steps
-                    conf = torch.rand_like(conf) if indice < 2 else conf
+                    merged_conf = torch.rand_like(merged_conf) if indice < 2 else merged_conf
                 elif randomize == "random":   # chose random prediction at each step
-                    conf = torch.rand_like(conf)
-
+                    merged_conf = torch.rand_like(merged_conf)
+                # st()
                 # do not predict on already predicted tokens
-                conf[~mask.bool()] = -math.inf
+                merged_conf[~mask.bool()] = -math.inf
 
                 # chose the predicted token with the highest confidence
                 tresh_conf, indice_mask = torch.topk(conf.view(nb_sample, -1), k=t, dim=-1)
                 tresh_conf = tresh_conf[:, -1]
 
                 # replace the chosen tokens
-                conf = (conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.patch_size, self.patch_size)
-                f_mask = (mask.view(nb_sample, self.patch_size, self.patch_size).float() * conf.view(nb_sample, self.patch_size, self.patch_size).float()).bool()
-                code[f_mask] = pred_code.view(nb_sample, self.patch_size, self.patch_size)[f_mask]
+                image_conf = merged_conf[:,:self.patch_size* self.patch_size]
+                image_mask = mask[:,:self.patch_size* self.patch_size]
+                text_conf = merged_conf[:,self.patch_size* self.patch_size:]
+                text_mask = mask[:,self.patch_size* self.patch_size:]
+                
+                image_conf = (image_conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.patch_size, self.patch_size)
+                f_image_mask = (image_mask.view(nb_sample, self.patch_size, self.patch_size).float() * image_conf.view(nb_sample, self.patch_size, self.patch_size).float()).bool()
+                code[f_image_mask] = pred_code.view(nb_sample, self.patch_size, self.patch_size)[f_image_mask]
+                
+                # st()
+                text_conf = (text_conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.seq_len)
+                f_text_mask = (text_mask.view(nb_sample, self.seq_len).float() * text_conf.view(nb_sample, self.seq_len).float()).bool()
+                text_code[f_text_mask] = text_code.view(nb_sample, self.seq_len)[f_text_mask]                
 
                 # update the mask
                 for i_mask, ind_mask in enumerate(indice_mask):
                     mask[i_mask, ind_mask] = 0
+                
+                # st()
                 l_codes.append(pred_code.view(nb_sample, self.patch_size, self.patch_size).clone())
-                l_mask.append(mask.view(nb_sample, self.patch_size, self.patch_size).clone())
+                l_mask.append(mask[:,:self.patch_size* self.patch_size].view(nb_sample, self.patch_size, self.patch_size).clone())
+                
+                text_l_codes.append(text_code.view(nb_sample, self.seq_len).clone())
+                text_l_mask.append(mask[:,self.patch_size* self.patch_size:].view(nb_sample, self.seq_len).clone())                
 
             # decode the final prediction
             _code = torch.clamp(code, 0,  self.codebook_size-1)
             x = self.ae.decode_code(_code)
 
         self.vit.train()
-        return x, l_codes, l_mask
+        return x, l_codes, l_mask, text_code, text_l_codes, text_l_mask

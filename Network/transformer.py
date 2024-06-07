@@ -162,7 +162,7 @@ class MaskTransformer(nn.Module):
         # Bias for the last linear output
         self.bias = nn.Parameter(torch.zeros((self.patch_size*self.patch_size) + self.text_seqlen, codebook_size+1+nclass+1 + self.text_tokens))
 
-    def forward(self, img_token, y=None, text_code=None,  drop_label=None, return_attn=False):
+    def forward(self, img_token, y=None, text_code=None,  drop_label=None, return_attn=False, eval=False):
         """ Forward.
             :param:
                 img_token      -> torch.LongTensor: bsize x 16 x 16, the encoded image tokens
@@ -174,19 +174,24 @@ class MaskTransformer(nn.Module):
                 attn:          -> list(torch.FloatTensor): list of attention for visualization
         """
         b, w, h = img_token.size()
-        # st()
+        
         cls_token = y.view(b, -1) + self.codebook_size + 1  # Shift the class token by the amount of codebook
 
         cls_token[drop_label] = self.codebook_size + 1 + self.nclass  # Drop condition
         # input = torch.cat([img_token.view(b, -1), cls_token.view(b, -1)], -1)  # concat visual tokens and class tokens
-        text_code = text_code + self.prev_size
-        input = torch.cat([img_token.view(b, -1),text_code],-1)
+        # st()
+        text_code_ = torch.clone(text_code)
+        unmasked_ids = torch.where(text_code_ != 1024)
+        text_code_[unmasked_ids] = text_code_[unmasked_ids] + self.prev_size
+        # st()
+        
+        input = torch.cat([img_token.view(b, -1),text_code_],-1)
         # st()
         tok_embeddings = self.tok_emb(input)
         
         # Position embedding
         pos_embeddings = self.pos_emb
-        x = tok_embeddings + pos_embeddings
+        x = tok_embeddings + pos_embeddings.repeat(tok_embeddings.shape[0],1,1)
 
         # transformer forward pass
         x = self.first_layer(x)
