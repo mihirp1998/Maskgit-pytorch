@@ -1,6 +1,7 @@
 # Main file to launch training or evaluation
 import os
 import random
+__import__("builtins").st = __import__("ipdb").set_trace
 
 import numpy as np
 import argparse
@@ -58,7 +59,7 @@ def launch_multi_main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data",         type=str,   default="imagenet", help="dataset on which dataset to train")
+    parser.add_argument("--data",         type=str,   default="cifar10", help="dataset on which dataset to train")
     parser.add_argument("--data-folder",  type=str,   default="",         help="folder containing the dataset")
     parser.add_argument("--vqgan-folder", type=str,   default="",         help="folder of the pretrained VQGAN")
     parser.add_argument("--vit-folder",   type=str,   default="",         help="folder where to save the Transformer")

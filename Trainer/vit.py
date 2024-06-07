@@ -4,6 +4,7 @@ import random
 import time
 import math
 
+
 import numpy as np
 from tqdm import tqdm
 from collections import deque
@@ -35,6 +36,9 @@ class MaskGIT(Trainer):
         self.patch_size = self.args.img_size // 2**(self.ae.encoder.num_resolutions-1)     # Load VQGAN
         self.criterion = self.get_loss("cross_entropy", label_smoothing=0.1)    # Get cross entropy loss
         self.optim = self.get_optim(self.vit, self.args.lr, betas=(0.9, 0.96))  # Get Adam Optimizer with weight decay
+
+        self.seq_len= 16
+        self.text_vocab_size = 128
         
         # Load data if aim to train or test the model
         if not self.args.debug:
@@ -167,6 +171,7 @@ class MaskGIT(Trainer):
         """ Train the model for 1 epoch """
         self.vit.train()
         cum_loss = 0.
+        # st()
         window_loss = deque(maxlen=self.args.grad_cum)
         bar = tqdm(self.train_data, leave=False) if self.args.is_master else self.train_data
         n = len(self.train_data)
@@ -188,9 +193,14 @@ class MaskGIT(Trainer):
             masked_code, mask = self.get_mask_code(code, value=self.args.mask_value, codebook_size=self.codebook_size)
 
             with torch.cuda.amp.autocast():                             # half precision
-                pred = self.vit(masked_code, y, drop_label=drop_label)  # The unmasked tokens prediction
+                text_code = torch.randint(0,self.text_vocab_size,[masked_code.shape[0],self.seq_len], device="cuda")
+                pred, pred_text = self.vit(masked_code, y,text_code, drop_label=drop_label)  # The unmasked tokens prediction
                 # Cross-entropy loss
                 loss = self.criterion(pred.reshape(-1, self.codebook_size + 1), code.view(-1)) / self.args.grad_cum
+                # st()
+                text_loss = self.criterion(pred_text.reshape(-1, self.text_vocab_size), text_code.view(-1)) / self.args.grad_cum
+                loss = (loss + text_loss)/2
+                
 
             # update weight if accumulation of gradient is done
             update_grad = self.args.iter % self.args.grad_cum == self.args.grad_cum - 1
@@ -348,6 +358,8 @@ class MaskGIT(Trainer):
                     code = torch.randint(0, self.codebook_size, (nb_sample, self.patch_size, self.patch_size)).to(self.args.device)
                 else:  # Code initialize with masked tokens
                     code = torch.full((nb_sample, self.patch_size, self.patch_size), self.args.mask_value).to(self.args.device)
+                    text_code = torch.full((nb_sample, self.seq_len), self.args.mask_value).to(self.args.device)
+                    st()
                 mask = torch.ones(nb_sample, self.patch_size*self.patch_size).to(self.args.device)
 
             # Instantiate scheduler
@@ -366,14 +378,22 @@ class MaskGIT(Trainer):
 
                 with torch.cuda.amp.autocast():  # half precision
                     if w != 0:
+                        st()
                         # Model Prediction
-                        logit = self.vit(torch.cat([code.clone(), code.clone()], dim=0),
+                        logit, text_logit = self.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                          torch.cat([labels, labels], dim=0),
+                                         torch.cat([text_code, text_code], dim=0),
                                          torch.cat([~drop, drop], dim=0))
                         logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                         _w = w * (indice / (len(scheduler)-1))
                         # Classifier Free Guidance
                         logit = (1 + _w) * logit_c - _w * logit_u
+                        
+                        text_logit_c, text_logit_u = torch.chunk(text_logit, 2, dim=0)
+                        _w = w * (indice / (len(scheduler)-1))
+                        # Classifier Free Guidance
+                        st()
+                        text_logit = (1 + _w) * text_logit_c - _w * text_logit_u
                     else:
                         logit = self.vit(code.clone(), labels, drop_label=~drop)
 
