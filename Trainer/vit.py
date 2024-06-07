@@ -37,8 +37,8 @@ class MaskGIT(Trainer):
         self.criterion = self.get_loss("cross_entropy", label_smoothing=0.1)    # Get cross entropy loss
         self.optim = self.get_optim(self.vit, self.args.lr, betas=(0.9, 0.96))  # Get Adam Optimizer with weight decay
 
-        self.seq_len= 16
-        self.text_vocab_size = 128
+        self.text_seq_len = self.args.text_seq_len
+        self.text_vocab_size = self.args.text_vocab_size
         
         # Load data if aim to train or test the model
         if not self.args.debug:
@@ -49,6 +49,8 @@ class MaskGIT(Trainer):
             from Metrics.sample_and_eval import SampleAndEval
             self.sae = SampleAndEval(device=self.args.device, num_images=50_000)
 
+        self.dtype = torch.bfloat16 if self.args.dtype == "bfloat16" else (torch.float16 if self.args.dtype == "float16" else torch.float32)
+
     def get_network(self, archi):
         """ return the network, load checkpoint if self.args.resume == True
             :param
@@ -58,7 +60,8 @@ class MaskGIT(Trainer):
         """
         if archi == "vit":
             model = MaskTransformer(
-                img_size=self.args.img_size, hidden_dim=768, codebook_size=self.codebook_size, depth=24, heads=16, mlp_dim=3072, dropout=0.1     # Small
+                # Small
+                img_size=self.args.img_size, hidden_dim=768, codebook_size=self.codebook_size, depth=24, heads=16, mlp_dim=3072, dropout=0.1, text_tokens=self.args.text_vocab_size, text_seqlen=self.args.text_seq_len
                 # img_size=self.args.img_size, hidden_dim=1024, codebook_size=1024, depth=32, heads=16, mlp_dim=3072, dropout=0.1  # Big
                 # img_size=self.args.img_size, hidden_dim=1024, codebook_size=1024, depth=48, heads=16, mlp_dim=3072, dropout=0.1  # Huge
             )
@@ -179,6 +182,7 @@ class MaskGIT(Trainer):
         for x, y in bar:
             x = x.to(self.args.device)
             y = y.to(self.args.device)
+            assert x.min() >= (0 - torch.finfo(self.dtype).eps) and x.max() <= (1 + torch.finfo(self.dtype).eps)
             x = 2 * x - 1  # normalize from x in [0,1] to [-1,1] for VQGAN
 
             # Drop xx% of the condition for cfg
@@ -192,15 +196,22 @@ class MaskGIT(Trainer):
             # Mask the encoded tokens
             masked_code, mask = self.get_mask_code(code, value=self.args.mask_value, codebook_size=self.codebook_size)
 
-            with torch.cuda.amp.autocast():                             # half precision
-                text_code = torch.randint(0,self.text_vocab_size,[masked_code.shape[0],self.seq_len], device="cuda")
-                pred, pred_text = self.vit(masked_code, y,text_code, drop_label=drop_label)  # The unmasked tokens prediction
+            masked_text_code = None
+            if self.args.unified_model:
+                text_code = y
+                assert text_code.min() >= 0 and text_code.max() < self.text_vocab_size
+                masked_text_code, text_mask = self.get_mask_code(text_code.unsqueeze(-1), value=self.args.mask_value, codebook_size=self.text_vocab_size)
+                masked_text_code, text_mask = masked_text_code.squeeze(-1), text_mask.squeeze(-1)
+
+            with torch.cuda.amp.autocast(dtype=self.dtype):                         # half precision                
+                pred, pred_text = self.vit(masked_code, y, text_code=masked_text_code, drop_label=drop_label)  # The unmasked tokens prediction
+                
                 # Cross-entropy loss
                 loss = self.criterion(pred.reshape(-1, self.codebook_size + 1), code.view(-1)) / self.args.grad_cum
-                # st()
-                text_loss = self.criterion(pred_text.reshape(-1, self.text_vocab_size), text_code.view(-1)) / self.args.grad_cum
-                loss = (loss + text_loss)/2
-                
+
+                if self.args.unified_model:
+                    text_loss = self.criterion(pred_text.reshape(-1, self.text_vocab_size), text_code.view(-1)) / self.args.grad_cum
+                    loss = (loss + text_loss)/2
 
             # update weight if accumulation of gradient is done
             update_grad = self.args.iter % self.args.grad_cum == self.args.grad_cum - 1
@@ -221,9 +232,9 @@ class MaskGIT(Trainer):
             if update_grad and self.args.is_master:
                 self.log_add_scalar('Train/Loss', np.array(window_loss).sum(), self.args.iter)
 
-            if self.args.iter % log_iter == 0 and self.args.is_master:
+            if self.args.iter > 0 and self.args.iter % log_iter == 0 and self.args.is_master:
                 # Generate sample for visualization
-                gen_sample = self.sample(nb_sample=10)[0]
+                gen_sample, l_codes, l_mask, t_codes, t_mask = self.sample(nb_sample=10)
                 gen_sample = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
                 self.log_add_img("Images/Sampling", gen_sample, self.args.iter)
                 # Show reconstruction
@@ -233,8 +244,11 @@ class MaskGIT(Trainer):
                 self.log_add_img("Images/Reconstruction", reco_sample, self.args.iter)
 
                 # Save Network
-                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth",
-                                  iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth", iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+
+                if self.args.wandb:
+                    import wandb
+                    wandb.log({"img": wandb.Image(gen_sample, caption=", ".join(self.train_data.dataset.decode(t_codes)))})
 
             self.args.iter += 1
 
@@ -243,6 +257,9 @@ class MaskGIT(Trainer):
     def fit(self):
         """ Train the model """
         if self.args.is_master:
+            if self.args.wandb:
+                import wandb
+                wandb.init(project="maskgit", name=f"{self.args.data}_{self.args.writer_log}_{time.strftime('%Y%m%d_%H%M%S')}")
             print("Start training:")
 
         start = time.time()
@@ -253,7 +270,7 @@ class MaskGIT(Trainer):
                 self.train_data.sampler.set_epoch(e)
 
             # Train for one epoch
-            train_loss = self.train_one_epoch()
+            train_loss = self.train_one_epoch(log_iter=self.args.log_iter)
 
             # Synch loss
             if self.args.is_multi_gpus:
@@ -361,8 +378,8 @@ class MaskGIT(Trainer):
                     code = torch.randint(0, self.codebook_size, (nb_sample, self.patch_size, self.patch_size)).to(self.args.device)
                 else:  # Code initialize with masked tokens
                     code = torch.full((nb_sample, self.patch_size, self.patch_size), self.args.mask_value).to(self.args.device)
-                    text_code = torch.full((nb_sample, self.seq_len), self.args.mask_value).to(self.args.device)
-                mask = torch.ones(nb_sample, self.patch_size*self.patch_size + self.seq_len ).to(self.args.device)
+                    text_code = torch.full((nb_sample, self.text_seq_len), self.args.mask_value).to(self.args.device)
+                mask = torch.ones(nb_sample, self.patch_size*self.patch_size + self.text_seq_len ).to(self.args.device)
 
             # Instantiate scheduler
             if isinstance(sched_mode, str):  # Standard ones
@@ -377,8 +394,8 @@ class MaskGIT(Trainer):
 
                 if mask.sum() == 0:  # Break if code is fully predicted
                     break
-                # st()
-                with torch.cuda.amp.autocast():  # half precision
+
+                with torch.cuda.amp.autocast(dtype=self.dtype):  # half precision
                     if w != 0:
                         # Model Prediction
                         logit, text_logit = self.vit(torch.cat([code.clone(), code.clone()], dim=0),
@@ -407,7 +424,7 @@ class MaskGIT(Trainer):
                 # Sample the code from the softmax prediction
                 text_distri = torch.distributions.Categorical(probs=text_prob)
                 text_code = text_distri.sample()                
-                text_conf = torch.gather(text_prob, 2, text_code.view(nb_sample, self.seq_len, 1))
+                text_conf = torch.gather(text_prob, 2, text_code.view(nb_sample, self.text_seq_len, 1))
 
                 merged_pred_code = torch.cat([pred_code,text_code],dim=1)
                 merged_conf = torch.cat([conf, text_conf], dim=1)
@@ -415,7 +432,7 @@ class MaskGIT(Trainer):
 
                 if randomize == "linear":  # add gumbel noise decreasing over the sampling process
                     ratio = (indice / (len(scheduler)-1))
-                    rand = r_temp * np.random.gumbel(size=(nb_sample, self.patch_size*self.patch_size + self.seq_len)) * (1 - ratio)
+                    rand = r_temp * np.random.gumbel(size=(nb_sample, self.patch_size*self.patch_size + self.text_seq_len)) * (1 - ratio)
                     merged_conf = torch.log(merged_conf.squeeze()) + torch.from_numpy(rand).to(self.args.device)
                 elif randomize == "warm_up":  # chose random sample for the 2 first steps
                     merged_conf = torch.rand_like(merged_conf) if indice < 2 else merged_conf
@@ -440,9 +457,9 @@ class MaskGIT(Trainer):
                 code[f_image_mask] = pred_code.view(nb_sample, self.patch_size, self.patch_size)[f_image_mask]
                 
                 # st()
-                text_conf = (text_conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.seq_len)
-                f_text_mask = (text_mask.view(nb_sample, self.seq_len).float() * text_conf.view(nb_sample, self.seq_len).float()).bool()
-                text_code[f_text_mask] = text_code.view(nb_sample, self.seq_len)[f_text_mask]                
+                text_conf = (text_conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.text_seq_len)
+                f_text_mask = (text_mask.view(nb_sample, self.text_seq_len).float() * text_conf.view(nb_sample, self.text_seq_len).float()).bool()
+                text_code[f_text_mask] = text_code.view(nb_sample, self.text_seq_len)[f_text_mask]                
 
                 # update the mask
                 for i_mask, ind_mask in enumerate(indice_mask):
@@ -452,8 +469,8 @@ class MaskGIT(Trainer):
                 l_codes.append(pred_code.view(nb_sample, self.patch_size, self.patch_size).clone())
                 l_mask.append(mask[:,:self.patch_size* self.patch_size].view(nb_sample, self.patch_size, self.patch_size).clone())
                 
-                text_l_codes.append(text_code.view(nb_sample, self.seq_len).clone())
-                text_l_mask.append(mask[:,self.patch_size* self.patch_size:].view(nb_sample, self.seq_len).clone())                
+                text_l_codes.append(text_code.view(nb_sample, self.text_seq_len).clone())
+                text_l_mask.append(mask[:,self.patch_size* self.patch_size:].view(nb_sample, self.text_seq_len).clone())                
 
             # decode the final prediction
             _code = torch.clamp(code, 0,  self.codebook_size-1)

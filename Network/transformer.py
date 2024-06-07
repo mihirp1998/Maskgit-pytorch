@@ -162,7 +162,7 @@ class MaskTransformer(nn.Module):
         # Bias for the last linear output
         self.bias = nn.Parameter(torch.zeros((self.patch_size*self.patch_size) + self.text_seqlen, codebook_size+1+nclass+1 + self.text_tokens))
 
-    def forward(self, img_token, y=None, text_code=None,  drop_label=None, return_attn=False, eval=False):
+    def forward(self, img_token, y=None, text_code=None, drop_label=None, return_attn=False):
         """ Forward.
             :param:
                 img_token      -> torch.LongTensor: bsize x 16 x 16, the encoded image tokens
@@ -174,19 +174,20 @@ class MaskTransformer(nn.Module):
                 attn:          -> list(torch.FloatTensor): list of attention for visualization
         """
         b, w, h = img_token.size()
-        
+
+        if y.ndim > 1:
+            # y is our text tokens if it is [B, N] so we give dummy conditioning.
+            y = torch.zeros_like(y[:, 0])
+
+        if drop_label.ndim > 1:
+            drop_label = drop_label[:, 0]
+
         cls_token = y.view(b, -1) + self.codebook_size + 1  # Shift the class token by the amount of codebook
 
         cls_token[drop_label] = self.codebook_size + 1 + self.nclass  # Drop condition
         # input = torch.cat([img_token.view(b, -1), cls_token.view(b, -1)], -1)  # concat visual tokens and class tokens
-        # st()
-        text_code_ = torch.clone(text_code)
-        unmasked_ids = torch.where(text_code_ != 1024)
-        text_code_[unmasked_ids] = text_code_[unmasked_ids] + self.prev_size
-        # st()
-        
-        input = torch.cat([img_token.view(b, -1),text_code_],-1)
-        # st()
+        text_code = torch.where(text_code == self.codebook_size, text_code, text_code + self.prev_size)
+        input = torch.cat([img_token.view(b, -1), text_code],-1)
         tok_embeddings = self.tok_emb(input)
         
         # Position embedding
@@ -202,6 +203,6 @@ class MaskTransformer(nn.Module):
 
         if return_attn:  # return list of attention
             return logit[:, :self.patch_size * self.patch_size, :self.codebook_size + 1], attn
-        # st()
+
         text_logit = logit[:, self.patch_size*self.patch_size:, self.prev_size:]
         return logit[:, :self.patch_size*self.patch_size, :self.codebook_size+1], text_logit

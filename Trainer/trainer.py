@@ -4,6 +4,7 @@ import json
 
 import numpy as np
 from PIL import Image
+from Trainer.celeba_dataset import CelebADataset
 import webdataset as wds
 
 import torch
@@ -145,6 +146,32 @@ class Trainer(object):
             train_loader = train_loader.unbatched().shuffle(1000).batched(self.args.bsize)
 
             return train_loader, None
+        
+        elif self.args.data == "celeba":
+            data_train = CelebADataset(
+                split="train",
+                overfit=self.args.overfit,
+                transform=transforms.Compose([
+                    transforms.Resize(self.args.img_size),
+                    transforms.RandomCrop((self.args.img_size, self.args.img_size)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ]),
+            )
+
+            # image, target = data_train.dataset[0]
+            # -1 to 1
+
+            data_test = CelebADataset(
+                split="valid",
+                overfit=self.args.overfit,
+                transform=transforms.Compose([
+                    transforms.Resize(self.args.img_size),
+                    transforms.CenterCrop((self.args.img_size, self.args.img_size)),
+                    transforms.ToTensor(),
+                ]),
+            )
+
 
         train_sampler = DistributedSampler(data_train, shuffle=True) if self.args.is_multi_gpus else None
         test_sampler = DistributedSampler(data_test, shuffle=True) if self.args.is_multi_gpus else None
