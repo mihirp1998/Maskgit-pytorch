@@ -94,6 +94,6 @@ class CelebADataset(Dataset):
         decoded_text = []
         for i in range(tokens.shape[0]):
             tokens_ = tokens[i].detach().cpu().tolist()
-            decoded_text.append(", ".join(f"self.attribute_strings[i]" for i in tokens_ if i < self.pad_token))
+            decoded_text.append(", ".join(f"{self.attribute_strings[i]}" for i in tokens_ if i < self.pad_token))
 
         return decoded_text[0] if tokens.ndim == 1 else decoded_text

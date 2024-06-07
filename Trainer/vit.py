@@ -232,23 +232,31 @@ class MaskGIT(Trainer):
             if update_grad and self.args.is_master:
                 self.log_add_scalar('Train/Loss', np.array(window_loss).sum(), self.args.iter)
 
+            if self.args.wandb and self.args.iter % 10 == 0 and self.args.is_master:
+                import wandb
+                wandb.log({"loss": loss})
+
             if self.args.iter > 0 and self.args.iter % log_iter == 0 and self.args.is_master:
                 # Generate sample for visualization
                 gen_sample, l_codes, l_mask, t_codes, t_mask = self.sample(nb_sample=10)
-                gen_sample = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
-                self.log_add_img("Images/Sampling", gen_sample, self.args.iter)
+                gen_sample_grid = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
+                self.log_add_img("Images/Sampling", gen_sample_grid, self.args.iter)
                 # Show reconstruction
                 unmasked_code = torch.softmax(pred, -1).max(-1)[1]
                 reco_sample = self.reco(x=x[:10], code=code[:10], unmasked_code=unmasked_code[:10], mask=mask[:10])
-                reco_sample = vutils.make_grid(reco_sample.data, nrow=10, padding=2, normalize=True)
-                self.log_add_img("Images/Reconstruction", reco_sample, self.args.iter)
-
-                # Save Network
-                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth", iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+                reco_sample_grid = vutils.make_grid(reco_sample.data, nrow=10, padding=2, normalize=True)
+                self.log_add_img("Images/Reconstruction", reco_sample_grid, self.args.iter)
 
                 if self.args.wandb:
                     import wandb
-                    wandb.log({"img": wandb.Image(gen_sample, caption=", ".join(self.train_data.dataset.decode(t_codes)))})
+                    table = wandb.Table(columns=["Image", "Caption"])
+                    captions = self.train_data.dataset.decode(text_code)
+                    for img, caption in zip(reco_sample, captions):
+                        table.add_data(wandb.Image(img), caption)
+                    wandb.log({"rec_img_table": table})
+
+                # Save Network
+                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth", iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
 
             self.args.iter += 1
 
@@ -259,7 +267,8 @@ class MaskGIT(Trainer):
         if self.args.is_master:
             if self.args.wandb:
                 import wandb
-                wandb.init(project="maskgit", name=f"{self.args.data}_{self.args.writer_log}_{time.strftime('%Y%m%d_%H%M%S')}")
+                wandb.init(project="maskgit", name=self.args.run_name, sync_tensorboard=True)
+                wandb.watch(self.vit, log_freq=200)
             print("Start training:")
 
         start = time.time()
