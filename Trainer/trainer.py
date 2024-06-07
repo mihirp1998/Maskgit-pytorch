@@ -150,6 +150,7 @@ class Trainer(object):
         elif self.args.data == "celeba":
             data_train = CelebADataset(
                 split="train",
+                overfit=self.args.overfit,
                 transform=transforms.Compose([
                     transforms.Resize(self.args.img_size),
                     transforms.RandomCrop((self.args.img_size, self.args.img_size)),
@@ -163,6 +164,7 @@ class Trainer(object):
 
             data_test = CelebADataset(
                 split="valid",
+                overfit=self.args.overfit,
                 transform=transforms.Compose([
                     transforms.Resize(self.args.img_size),
                     transforms.CenterCrop((self.args.img_size, self.args.img_size)),

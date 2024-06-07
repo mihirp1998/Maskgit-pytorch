@@ -37,8 +37,8 @@ class MaskGIT(Trainer):
         self.criterion = self.get_loss("cross_entropy", label_smoothing=0.1)    # Get cross entropy loss
         self.optim = self.get_optim(self.vit, self.args.lr, betas=(0.9, 0.96))  # Get Adam Optimizer with weight decay
 
-        self.seq_len= 16
-        self.text_vocab_size = 128
+        self.text_seq_len = self.args.text_seq_len
+        self.text_vocab_size = self.args.text_vocab_size
         
         # Load data if aim to train or test the model
         if not self.args.debug:
@@ -60,7 +60,8 @@ class MaskGIT(Trainer):
         """
         if archi == "vit":
             model = MaskTransformer(
-                img_size=self.args.img_size, hidden_dim=768, codebook_size=self.codebook_size, depth=24, heads=16, mlp_dim=3072, dropout=0.1     # Small
+                # Small
+                img_size=self.args.img_size, hidden_dim=768, codebook_size=self.codebook_size, depth=24, heads=16, mlp_dim=3072, dropout=0.1, text_tokens=self.args.text_vocab_size, text_seqlen=self.args.text_seq_len
                 # img_size=self.args.img_size, hidden_dim=1024, codebook_size=1024, depth=32, heads=16, mlp_dim=3072, dropout=0.1  # Big
                 # img_size=self.args.img_size, hidden_dim=1024, codebook_size=1024, depth=48, heads=16, mlp_dim=3072, dropout=0.1  # Huge
             )
@@ -195,16 +196,22 @@ class MaskGIT(Trainer):
             # Mask the encoded tokens
             masked_code, mask = self.get_mask_code(code, value=self.args.mask_value, codebook_size=self.codebook_size)
 
-            with torch.cuda.amp.autocast(dtype=self.dtype):                         # half precision
-                text_code = torch.randint(0,self.text_vocab_size,[masked_code.shape[0],self.seq_len], device="cuda")
-                pred, pred_text = self.vit(masked_code, y,text_code, drop_label=drop_label)  # The unmasked tokens prediction
+            masked_text_code = None
+            if self.args.unified_model:
+                text_code = y
+                assert text_code.min() >= 0 and text_code.max() < self.text_vocab_size
+                masked_text_code, text_mask = self.get_mask_code(text_code.unsqueeze(-1), value=self.args.mask_value, codebook_size=self.text_vocab_size)
+                masked_text_code, text_mask = masked_text_code.squeeze(-1), text_mask.squeeze(-1)
+
+            with torch.cuda.amp.autocast(dtype=self.dtype):                         # half precision                
+                pred, pred_text = self.vit(masked_code, y, text_code=masked_text_code, drop_label=drop_label)  # The unmasked tokens prediction
                 
                 # Cross-entropy loss
                 loss = self.criterion(pred.reshape(-1, self.codebook_size + 1), code.view(-1)) / self.args.grad_cum
-                # st()
-                text_loss = self.criterion(pred_text.reshape(-1, self.text_vocab_size), text_code.view(-1)) / self.args.grad_cum
-                loss = (loss + text_loss)/2
-                
+
+                if self.args.unified_model:
+                    text_loss = self.criterion(pred_text.reshape(-1, self.text_vocab_size), text_code.view(-1)) / self.args.grad_cum
+                    loss = (loss + text_loss)/2
 
             # update weight if accumulation of gradient is done
             update_grad = self.args.iter % self.args.grad_cum == self.args.grad_cum - 1
@@ -225,9 +232,9 @@ class MaskGIT(Trainer):
             if update_grad and self.args.is_master:
                 self.log_add_scalar('Train/Loss', np.array(window_loss).sum(), self.args.iter)
 
-            if self.args.iter % log_iter == 0 and self.args.is_master:
+            if self.args.iter > 0 and self.args.iter % log_iter == 0 and self.args.is_master:
                 # Generate sample for visualization
-                gen_sample = self.sample(nb_sample=10)[0]
+                gen_sample, l_codes, l_mask, t_codes, t_mask = self.sample(nb_sample=10)
                 gen_sample = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
                 self.log_add_img("Images/Sampling", gen_sample, self.args.iter)
                 # Show reconstruction
@@ -237,8 +244,11 @@ class MaskGIT(Trainer):
                 self.log_add_img("Images/Reconstruction", reco_sample, self.args.iter)
 
                 # Save Network
-                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth",
-                                  iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth", iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+
+                if self.args.wandb:
+                    import wandb
+                    wandb.log({"img": wandb.Image(gen_sample, caption=", ".join(self.train_data.dataset.decode(t_codes)))})
 
             self.args.iter += 1
 
@@ -247,6 +257,9 @@ class MaskGIT(Trainer):
     def fit(self):
         """ Train the model """
         if self.args.is_master:
+            if self.args.wandb:
+                import wandb
+                wandb.init(project="maskgit", name=f"{self.args.data}_{self.args.writer_log}_{time.strftime('%Y%m%d_%H%M%S')}")
             print("Start training:")
 
         start = time.time()
@@ -362,8 +375,7 @@ class MaskGIT(Trainer):
                     code = torch.randint(0, self.codebook_size, (nb_sample, self.patch_size, self.patch_size)).to(self.args.device)
                 else:  # Code initialize with masked tokens
                     code = torch.full((nb_sample, self.patch_size, self.patch_size), self.args.mask_value).to(self.args.device)
-                    text_code = torch.full((nb_sample, self.seq_len), self.args.mask_value).to(self.args.device)
-                    st()
+                    text_code = torch.full((nb_sample, self.text_seq_len), self.args.mask_value).to(self.args.device)
                 mask = torch.ones(nb_sample, self.patch_size*self.patch_size).to(self.args.device)
 
             # Instantiate scheduler
@@ -382,7 +394,6 @@ class MaskGIT(Trainer):
 
                 with torch.cuda.amp.autocast(dtype=self.dtype):  # half precision
                     if w != 0:
-                        st()
                         # Model Prediction
                         logit, text_logit = self.vit(torch.cat([code.clone(), code.clone()], dim=0),
                                          torch.cat([labels, labels], dim=0),
@@ -396,7 +407,6 @@ class MaskGIT(Trainer):
                         text_logit_c, text_logit_u = torch.chunk(text_logit, 2, dim=0)
                         _w = w * (indice / (len(scheduler)-1))
                         # Classifier Free Guidance
-                        st()
                         text_logit = (1 + _w) * text_logit_c - _w * text_logit_u
                     else:
                         logit = self.vit(code.clone(), labels, drop_label=~drop)

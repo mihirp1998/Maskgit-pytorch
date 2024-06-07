@@ -162,7 +162,7 @@ class MaskTransformer(nn.Module):
         # Bias for the last linear output
         self.bias = nn.Parameter(torch.zeros((self.patch_size*self.patch_size) + self.text_seqlen, codebook_size+1+nclass+1 + self.text_tokens))
 
-    def forward(self, img_token, y=None, text_code=None,  drop_label=None, return_attn=False):
+    def forward(self, img_token, y=None, text_code=None, drop_label=None, return_attn=False):
         """ Forward.
             :param:
                 img_token      -> torch.LongTensor: bsize x 16 x 16, the encoded image tokens
@@ -186,9 +186,8 @@ class MaskTransformer(nn.Module):
 
         cls_token[drop_label] = self.codebook_size + 1 + self.nclass  # Drop condition
         # input = torch.cat([img_token.view(b, -1), cls_token.view(b, -1)], -1)  # concat visual tokens and class tokens
-        text_code = text_code + self.prev_size
-        input = torch.cat([img_token.view(b, -1),text_code],-1)
-        # st()
+        text_code = torch.where(text_code == self.codebook_size, text_code, text_code + self.prev_size)
+        input = torch.cat([img_token.view(b, -1), text_code],-1)
         tok_embeddings = self.tok_emb(input)
         
         # Position embedding
@@ -204,6 +203,6 @@ class MaskTransformer(nn.Module):
 
         if return_attn:  # return list of attention
             return logit[:, :self.patch_size * self.patch_size, :self.codebook_size + 1], attn
-        # st()
+
         text_logit = logit[:, self.patch_size*self.patch_size:, self.prev_size:]
         return logit[:, :self.patch_size*self.patch_size, :self.codebook_size+1], text_logit

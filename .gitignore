@@ -3,3 +3,4 @@ logs/
 __pycache__/
 pretrained_maskgit/
 *.pth
+wandb/

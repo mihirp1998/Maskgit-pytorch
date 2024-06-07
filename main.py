@@ -85,6 +85,12 @@ if __name__ == "__main__":
     parser.add_argument("--debug",        action='store_true',            help="debug")
     parser.add_argument("--dtype",        type=str,   default="bfloat16",   help="dtype")
     parser.add_argument("--log_iter",      type=int,   default=2500,          help="log every x iterations")
+    parser.add_argument("--overfit",      action='store_true',            help="overfit the model")
+    parser.add_argument("--wandb", action='store_true',            help="use wandb")
+    parser.add_argument("--unified_model", action='store_true',            help="use unified model")
+    parser.add_argument("--text_seq_len", type=int,   default=40,          help="text sequence length")
+    parser.add_argument("--text_vocab_size", type=int,   default=41,          help="text vocab size")
+
     args = parser.parse_args()
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.iter = 0
