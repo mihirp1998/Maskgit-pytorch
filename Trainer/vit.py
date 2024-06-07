@@ -70,7 +70,7 @@ class MaskGIT(Trainer):
                 ckpt = self.args.vit_folder
                 ckpt += "current.pth" if os.path.isdir(self.args.vit_folder) else ""
                 if self.args.is_master:
-                    print("load ckpt from:", ckpt)
+                    print("load ckpt and resume from:", ckpt)
                 # Read checkpoint file
                 checkpoint = torch.load(ckpt, map_location='cpu')
                 # Update the current epoch and iteration
@@ -78,6 +78,11 @@ class MaskGIT(Trainer):
                 self.args.global_epoch += checkpoint['global_epoch']
                 # Load network
                 model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            elif self.args.ckpt_path:
+                if self.args.is_master:
+                    print("load ckpt from:", self.args.ckpt_path)
+                ckpt = torch.load(self.args.ckpt_path, map_location='cpu')
+                model.load_state_dict(ckpt['model_state_dict'], strict=False)
 
             model = model.to(self.args.device)
             if self.args.is_multi_gpus:  # put model on multi GPUs if available
@@ -202,6 +207,7 @@ class MaskGIT(Trainer):
                 assert text_code.min() >= 0 and text_code.max() < self.text_vocab_size
                 masked_text_code, text_mask = self.get_mask_code(text_code.unsqueeze(-1), value=self.args.mask_value, codebook_size=self.text_vocab_size)
                 masked_text_code, text_mask = masked_text_code.squeeze(-1), text_mask.squeeze(-1)
+                # print(0, masked_text_code[0].tolist())
 
             with torch.cuda.amp.autocast(dtype=self.dtype):                         # half precision                
                 pred, pred_text = self.vit(masked_code, y, text_code=masked_text_code, drop_label=drop_label)  # The unmasked tokens prediction
@@ -232,31 +238,120 @@ class MaskGIT(Trainer):
             if update_grad and self.args.is_master:
                 self.log_add_scalar('Train/Loss', np.array(window_loss).sum(), self.args.iter)
 
-            if self.args.wandb and self.args.iter % 10 == 0 and self.args.is_master:
+            if self.args.wandb and self.args.iter and self.args.is_master:
                 import wandb
-                wandb.log({"loss": loss})
+                wandb.log({"loss": loss}, step=self.args.iter)
+            try:
+                if self.args.iter % log_iter == 0 and self.args.is_master:
+                    # Generate sample for visualization
+                    gen_sample, l_codes, l_mask, gen_text, t_codes, t_mask = self.sample(nb_sample=10)
+                    gen_sample_grid = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
+                    self.log_add_img("Images/Sampling", gen_sample_grid, self.args.iter)
+                    # Show reconstruction
+                    unmasked_code = torch.softmax(pred, -1).max(-1)[1]
+                    reco_sample = self.reco(x=x[:10], code=code[:10], unmasked_code=unmasked_code[:10], mask=mask[:10])
+                    reco_sample_grid = vutils.make_grid(reco_sample.data, nrow=10, padding=2, normalize=True)
+                    self.log_add_img("Images/Reconstruction", reco_sample_grid, self.args.iter)
 
-            if self.args.iter > 0 and self.args.iter % log_iter == 0 and self.args.is_master:
-                # Generate sample for visualization
-                gen_sample, l_codes, l_mask, t_codes, t_mask = self.sample(nb_sample=10)
-                gen_sample_grid = vutils.make_grid(gen_sample, nrow=10, padding=2, normalize=True)
-                self.log_add_img("Images/Sampling", gen_sample_grid, self.args.iter)
-                # Show reconstruction
-                unmasked_code = torch.softmax(pred, -1).max(-1)[1]
-                reco_sample = self.reco(x=x[:10], code=code[:10], unmasked_code=unmasked_code[:10], mask=mask[:10])
-                reco_sample_grid = vutils.make_grid(reco_sample.data, nrow=10, padding=2, normalize=True)
-                self.log_add_img("Images/Reconstruction", reco_sample_grid, self.args.iter)
+                    if self.args.wandb:
+                        import wandb
+                        code_imgs, masked_code_imgs, unmasked_code_imgs = torch.split(reco_sample, 10)
+                    
+                        gt_captions = self.train_data.dataset.decode(text_code)
+                        masked_captions = self.train_data.dataset.decode(masked_text_code)
+                        pred_text_code = torch.softmax(pred_text, -1).max(-1)[1]
+                        unmasked_captions = self.train_data.dataset.decode(pred_text_code)
+                        
+                        def get_attributes(_code):
+                            _attributes = set(torch.unique(_code).tolist())
+                            if self.text_vocab_size in _attributes:
+                                _attributes.remove(self.text_vocab_size)
+                            if self.args.mask_value in _attributes:
+                                _attributes.remove(self.args.mask_value)
+                            return _attributes
 
-                if self.args.wandb:
-                    import wandb
-                    table = wandb.Table(columns=["Image", "Caption"])
-                    captions = self.train_data.dataset.decode(text_code)
-                    for img, caption in zip(reco_sample, captions):
-                        table.add_data(wandb.Image(img), caption)
-                    wandb.log({"rec_img_table": table})
+                        avg_precision = 0
+                        avg_recall = 0
+                        correct_attributes = []
+                        correct_new_attributes = []
+                        missing_attributes = []
+                        wrong_attributes = []
+                        recalls = []
+                        precisions = []
+                        for i in range(text_code.shape[0]):
+                            gt_attributes = get_attributes(text_code[i])
+                            input_attributes = get_attributes(masked_text_code[i])
+                            pred_attributes = get_attributes(pred_text_code[i])
 
-                # Save Network
-                self.save_network(model=self.vit, path=self.args.vit_folder+"current.pth", iter=self.args.iter, optimizer=self.optim, global_epoch=self.args.global_epoch)
+                            correct_attributes.append(self.train_data.dataset.idxs_to_attributes(sorted(list())))
+                            correct_new_attributes.append(self.train_data.dataset.idxs_to_attributes(sorted(list(
+                                (gt_attributes & pred_attributes) - input_attributes
+                            ))))
+                            missing_attributes.append(self.train_data.dataset.idxs_to_attributes(sorted(list(gt_attributes - pred_attributes))))
+                            wrong_attributes.append(self.train_data.dataset.idxs_to_attributes(sorted(list(pred_attributes - gt_attributes))))
+
+                            precision = len(gt_attributes & pred_attributes) / len(pred_attributes) if len(pred_attributes) > 0 else 0
+                            recall = len(gt_attributes & pred_attributes) / len(gt_attributes) if len(gt_attributes) > 0 else 0
+
+                            precisions.append(precision)
+                            recalls.append(recall)
+
+                        avg_precision = sum(precisions) / len(precisions)
+                        avg_recall = sum(recalls) / len(recalls)
+
+                        mask_values = torch.sum(~mask, dim=(1, 2)) / mask[0].numel()
+
+                        pred_table = wandb.Table(
+                            columns=[
+                                "GT Reconstruction Image", 
+                                "GT Reconstruction Caption", 
+                                "Masked [Input] Image", 
+                                "Masked [Input] Caption", 
+                                "Unmasked [Pred] Image", 
+                                "Unmasked [Pred] Caption", 
+                                "Correct New Attributes", 
+                                "Correct Attributes", 
+                                "Missing Attributes", 
+                                "Wrong Attributes", 
+                                "Mask Value", 
+                                "Precision", 
+                                "Recall"
+                            ]
+                        )
+                        for gt_img, gt_caption, masked_img, masked_caption, img, caption, correct_new_attribute, correct, missing, wrong, mask_value, precision, recall in zip(code_imgs, gt_captions, masked_code_imgs, masked_captions, unmasked_code_imgs, unmasked_captions, correct_new_attributes, correct_attributes, missing_attributes, wrong_attributes, mask_values, precisions, recalls):
+                            pred_table.add_data(wandb.Image(gt_img), gt_caption, wandb.Image(masked_img), masked_caption, wandb.Image(img), caption, correct_new_attribute, correct, missing, wrong, mask_value, precision, recall)
+
+                        gen_table = wandb.Table(columns=["Uncond Sampled Image", "Uncond Sampled Caption"])
+                        gen_captions = self.train_data.dataset.decode(gen_text)
+                        for img, caption in zip(gen_sample, gen_captions):
+                            gen_table.add_data(wandb.Image(img), caption)
+
+                        wandb.log({
+                            "uncond_sample_table": gen_table,
+                            "pred_table": pred_table,
+                            "mean_precision": avg_precision,
+                            "mean_recall": avg_recall
+                        }, step=self.args.iter)
+
+                    # Save Network
+                    if self.args.iter > 0:
+                        def save_ckpt(_path):
+                            self.save_network(
+                                model=self.vit,
+                                path=_path,
+                                iter=self.args.iter,
+                                optimizer=self.optim,
+                                global_epoch=self.args.global_epoch
+                            )
+
+                        save_ckpt(self.args.output_dir / "current.pth")
+                        if self.args.global_epoch % 20 == 0:
+                            save_ckpt(self.args.output_dir / f"epoch_{self.args.global_epoch:03d}.pth")
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(e)
 
             self.args.iter += 1
 
@@ -267,7 +362,7 @@ class MaskGIT(Trainer):
         if self.args.is_master:
             if self.args.wandb:
                 import wandb
-                wandb.init(project="maskgit", name=self.args.run_name, sync_tensorboard=True)
+                wandb.init(config=self.args, project="maskgit", name=self.args.run_name)
                 wandb.watch(self.vit, log_freq=200)
             print("Start training:")
 
@@ -411,7 +506,7 @@ class MaskGIT(Trainer):
                                          torch.cat([labels, labels], dim=0),
                                          torch.cat([text_code, text_code], dim=0),
                                          torch.cat([~drop, drop], dim=0))
-                        # st()
+
                         logit_c, logit_u = torch.chunk(logit, 2, dim=0)
                         _w = w * (indice / (len(scheduler)-1))
                         # Classifier Free Guidance
@@ -420,7 +515,6 @@ class MaskGIT(Trainer):
                         # Classifier Free Guidance
                         text_logit = (1 + _w) * text_logit_c - _w * text_logit_u
                     else:
-                        # st()
                         logit, text_logit = self.vit(code.clone(), labels, text_code, drop_label=~drop)
                 
                 prob = torch.softmax(logit * sm_temp, -1)
@@ -465,7 +559,6 @@ class MaskGIT(Trainer):
                 f_image_mask = (image_mask.view(nb_sample, self.patch_size, self.patch_size).float() * image_conf.view(nb_sample, self.patch_size, self.patch_size).float()).bool()
                 code[f_image_mask] = pred_code.view(nb_sample, self.patch_size, self.patch_size)[f_image_mask]
                 
-                # st()
                 text_conf = (text_conf >= tresh_conf.unsqueeze(-1)).view(nb_sample, self.text_seq_len)
                 f_text_mask = (text_mask.view(nb_sample, self.text_seq_len).float() * text_conf.view(nb_sample, self.text_seq_len).float()).bool()
                 text_code[f_text_mask] = text_code.view(nb_sample, self.text_seq_len)[f_text_mask]                
@@ -474,7 +567,6 @@ class MaskGIT(Trainer):
                 for i_mask, ind_mask in enumerate(indice_mask):
                     mask[i_mask, ind_mask] = 0
                 
-                # st()
                 l_codes.append(pred_code.view(nb_sample, self.patch_size, self.patch_size).clone())
                 l_mask.append(mask[:,:self.patch_size* self.patch_size].view(nb_sample, self.patch_size, self.patch_size).clone())
                 

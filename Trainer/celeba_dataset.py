@@ -12,7 +12,7 @@ from torchvision.datasets import CelebA
 class CelebADataset(Dataset):
     def __init__(
         self,
-        root="/scratch/aswerdlo/data",
+        root="/home/aswerdlo/repos/lib/UniD3/data",
         overfit=True,
         split="train",
         **kwargs
@@ -86,14 +86,21 @@ class CelebADataset(Dataset):
         true_attributes = attr.nonzero().squeeze(-1)
         tokens[: len(true_attributes)] = true_attributes
         return tokens
+    
+    def idxs_to_attributes(self, idxs, mask_token_idx: int = 1024):
+        if any(idx > self.pad_token and idx != mask_token_idx for idx in idxs):
+            assert False, f"Found invalid index: {idxs}"
+        return ", ".join([self.attribute_strings[idx] if idx < self.pad_token else ("Mask" if idx == mask_token_idx else "Pad") for idx in idxs])
 
-    def decode(self, tokens):
+    def decode(self, tokens, mask_token_idx: int = 1024):
         if tokens.ndim == 1:
             tokens = tokens.unsqueeze(0)
 
         decoded_text = []
         for i in range(tokens.shape[0]):
             tokens_ = tokens[i].detach().cpu().tolist()
-            decoded_text.append(", ".join(f"{self.attribute_strings[i]}" for i in tokens_ if i < self.pad_token))
-
+            decoded_str = ", ".join("Mask" if i == mask_token_idx else f"{self.attribute_strings[i]}" for i in tokens_ if i < self.pad_token or i == mask_token_idx)
+            if decoded_str == "":
+                decoded_str = "No attributes"
+            decoded_text.append(decoded_str)
         return decoded_text[0] if tokens.ndim == 1 else decoded_text

@@ -37,7 +37,7 @@ class Trainer(object):
     def __init__(self, args):
         """ Initialization of the Trainer """
         self.args = args
-        self.writer = None if args.writer_log == "" else SummaryWriter(log_dir=args.writer_log)  # Tensorboard writer
+        self.writer = None if args.output_dir == "" else SummaryWriter(log_dir=str(args.output_dir.resolve()))  # Tensorboard writer
 
     def get_data(self):
         """ class to load data """

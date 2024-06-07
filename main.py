@@ -1,3 +1,4 @@
+from typing import Optional
 from tap import Tap
 import os
 import random
@@ -15,7 +16,7 @@ class ArgumentParser(Tap):
     data_folder: str = ""
     vqgan_folder: str = ""
     vit_folder: str = ""
-    writer_log: Path = Path("logs")
+    output_dir: Path = Path("logs")
     sched_mode: str = "arccos"
     grad_cum: int = 1
     channel: int = 3
@@ -41,6 +42,8 @@ class ArgumentParser(Tap):
     unified_model: bool = False
     text_seq_len: int = 40
     text_vocab_size: int = 41
+    run_name: Optional[str] = None
+    ckpt_path: Optional[str] = None
 
 def main(args):
     """ Main function: Train or eval MaskGIT """
@@ -88,8 +91,9 @@ if __name__ == "__main__":
     args.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.iter = 0
     args.global_epoch = 0
-    args.run_name = f"{args.data}_{time.strftime('%Y%m%d_%H%M%S')}"
-    args.writer_log = f"logs/{args.run_name}"
+    args.run_name = f"{args.run_name}_" if args.run_name else ""
+    args.run_name = f"{args.run_name}{args.data}_{time.strftime('%Y%m%d_%H%M%S')}"
+    args.output_dir = Path('logs') / f"{args.run_name}"
 
     if args.seed > 0:  # Set the seed for reproducibility
         torch.manual_seed(args.seed)

@@ -186,6 +186,8 @@ class MaskTransformer(nn.Module):
 
         cls_token[drop_label] = self.codebook_size + 1 + self.nclass  # Drop condition
         # input = torch.cat([img_token.view(b, -1), cls_token.view(b, -1)], -1)  # concat visual tokens and class tokens
+        
+        text_code = text_code.clone()
         text_code = torch.where(text_code == self.codebook_size, text_code, text_code + self.prev_size)
         input = torch.cat([img_token.view(b, -1), text_code],-1)
         tok_embeddings = self.tok_emb(input)
